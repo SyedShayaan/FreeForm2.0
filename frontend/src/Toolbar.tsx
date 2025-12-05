@@ -9,6 +9,7 @@ interface ToolbarProps {
 }
 
 const tools: { value: Tool; label: string; icon: string }[] = [
+  { value: 'select', label: 'Select', icon: '👆' },
   { value: 'pen', label: 'Pen', icon: '✏️' },
   { value: 'lasso', label: 'Lasso', icon: '◉' },
   { value: 'line', label: 'Line', icon: '/' },

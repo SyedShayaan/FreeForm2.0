@@ -1,4 +1,4 @@
-export type Tool = 'pen' | 'line' | 'rectangle' | 'circle' | 'arrow' | 'eraser' | 'text' | 'object-eraser' | 'laser' | 'lasso';
+export type Tool = 'select' | 'pen' | 'line' | 'rectangle' | 'circle' | 'arrow' | 'eraser' | 'text' | 'object-eraser' | 'laser' | 'lasso';
 export type LineType = 'solid' | 'dashed';
 export type BackgroundStyle = 'blank' | 'grid' | 'dots' | 'lines';
 

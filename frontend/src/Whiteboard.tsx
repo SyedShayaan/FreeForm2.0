@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { useGesture } from '@use-gesture/react';
 import { DrawEvent, Point, ToolOptions } from './types';
+
+type ResizeHandle = 'tl' | 'tr' | 'bl' | 'br' | 'start' | 'end';
 
 interface WhiteboardProps {
   options: ToolOptions;
@@ -39,13 +42,415 @@ export default function Whiteboard({
   const imageCache = useRef<Map<string, HTMLImageElement>>(new Map());
   const [pasteNotification, setPasteNotification] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
-  const lastPinchDistanceRef = useRef<number | null>(null);
   const lastMousePosRef = useRef<Point>({ x: 0, y: 0 });
   const deletedElementsRef = useRef<Set<string>>(new Set());
   const [selectedElementIds, setSelectedElementIds] = useState<Set<string>>(new Set());
   const [lassoPath, setLassoPath] = useState<Point[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState<Point | null>(null);
+  const [resizeHandle, setResizeHandle] = useState<ResizeHandle | null>(null);
+  const [resizingElementId, setResizingElementId] = useState<string | null>(null);
+
+  // Initialize gesture handlers
+  const bind = useGesture({
+    onDrag: ({ first, last, active, xy: [cx, cy], event, buttons, shiftKey }) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      
+      // Handle touch pan specifically (2 fingers) - handled by onPinch usually
+      // But check if we need to prevent default
+      if (event.type.startsWith('touch') && (event as unknown as TouchEvent).touches?.length === 2) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const point = {
+        x: (cx - rect.left - offset.x) / zoom,
+        y: (cy - rect.top - offset.y) / zoom
+      };
+
+      // Pan (Middle Mouse or Shift + Left)
+      const isPanGesture = buttons === 4 || (buttons === 1 && shiftKey);
+      
+      if (isPanGesture) {
+        if (first) {
+          setIsPanning(true);
+          setPanStart({ x: cx - offset.x, y: cy - offset.y });
+        } else if (active) {
+          setOffset({ x: cx - panStart.x, y: cy - panStart.y });
+        } else if (last) {
+          setIsPanning(false);
+        }
+        return;
+      }
+
+      // Drawing / Tools Logic
+      if (isPanning) return;
+
+      // Select Tool Logic
+      if (options.tool === 'select') {
+        if (first) {
+          // Check for double click to edit text
+          if ((event as MouseEvent).detail === 2) {
+            const clickedElement = [...elements].reverse().find(el => 
+              selectedElementIds.has(el.id) && isPointNearElement(point, el, 10)
+            );
+            if (clickedElement) {
+              const bounds = getElementBounds(clickedElement);
+              if (bounds) {
+                const centerX = (bounds.minX + bounds.maxX) / 2;
+                const centerY = (bounds.minY + bounds.maxY) / 2;
+                setTextInputPos({ x: centerX, y: centerY });
+                setTextInputValue(clickedElement.text || '');
+                setEditingTextId(clickedElement.id);
+                return;
+              }
+            }
+          }
+
+          // 1. Check Resize Handles
+          if (selectedElementIds.size === 1) {
+            const id = Array.from(selectedElementIds)[0];
+            const element = elements.find(el => el.id === id);
+            if (element) {
+              const handle = getResizeHandleAtPoint(point, element);
+              if (handle) {
+                setResizeHandle(handle);
+                setResizingElementId(id);
+                setIsDragging(true);
+                return;
+              }
+            }
+          }
+
+          // 2. Check Element Click (Move)
+          const clickedElement = [...elements].reverse().find(el => 
+            isPointNearElement(point, el, 10)
+          );
+
+          if (clickedElement) {
+            if (!selectedElementIds.has(clickedElement.id)) {
+              if (shiftKey) {
+                setSelectedElementIds(prev => new Set(prev).add(clickedElement.id));
+              } else {
+                setSelectedElementIds(new Set([clickedElement.id]));
+              }
+            } else if (shiftKey) {
+               setSelectedElementIds(prev => {
+                 const next = new Set(prev);
+                 next.delete(clickedElement.id);
+                 return next;
+               });
+               return; // Don't start dragging if deselecting
+            }
+            
+            setIsDragging(true);
+            setDragStart(point);
+          } else {
+            // Clicked empty space - deselect unless shift
+            if (!shiftKey) {
+              setSelectedElementIds(new Set());
+            }
+          }
+          return;
+        }
+
+        if (active) {
+          // Handle Resizing
+          if (resizeHandle && resizingElementId) {
+             setElements(prev => prev.map(el => {
+               if (el.id === resizingElementId) {
+                 const bounds = getElementBounds(el);
+                 if (!bounds) return el;
+                 
+                 let { minX, minY, maxX, maxY } = bounds;
+                 // Simple resizing logic for Rect/Circle (box based)
+                 // For line/arrow it's different, but let's start with box logic
+                 
+                 if (resizeHandle.includes('l')) minX = point.x;
+                 if (resizeHandle.includes('r')) maxX = point.x;
+                 if (resizeHandle.includes('t')) minY = point.y;
+                 if (resizeHandle.includes('b')) maxY = point.y;
+
+                 // Enforce min size
+                 if (maxX - minX < 10) maxX = minX + 10;
+                 if (maxY - minY < 10) maxY = minY + 10;
+
+                 // Update points based on new bounds
+                 let newPoints = el.points;
+                 if (el.tool === 'rectangle' || el.tool === 'circle' || el.imageData) {
+                   newPoints = [{ x: minX, y: minY }, { x: maxX, y: maxY }];
+                 } else if (el.tool === 'line' || el.tool === 'arrow') {
+                   // Handle line start/end resizing
+                   if (resizeHandle === 'start') {
+                       newPoints = [point, ...newPoints.slice(1)];
+                   } else if (resizeHandle === 'end') {
+                       newPoints = [...newPoints.slice(0, -1), point];
+                   }
+                 }
+
+                 return { ...el, points: newPoints };
+               }
+               return el;
+             }));
+             return;
+          }
+
+          // Handle Moving
+          if (isDragging && dragStart && selectedElementIds.size > 0) {
+            const dx = point.x - dragStart.x;
+            const dy = point.y - dragStart.y;
+            
+            setElements(prev => prev.map(el => {
+              if (selectedElementIds.has(el.id)) {
+                return {
+                  ...el,
+                  points: el.points.map(p => ({ x: p.x + dx, y: p.y + dy }))
+                };
+              }
+              return el;
+            }));
+            setDragStart(point);
+          }
+          return;
+        }
+
+        if (last) {
+          if (resizingElementId) {
+             const el = elements.find(e => e.id === resizingElementId);
+             if (el) onDrawEvent(el);
+             setResizingElementId(null);
+             setResizeHandle(null);
+             setIsDragging(false);
+          } else if (isDragging && dragStart) {
+             elements.forEach(el => {
+               if (selectedElementIds.has(el.id)) onDrawEvent(el);
+             });
+             setIsDragging(false);
+             setDragStart(null);
+          }
+          return;
+        }
+        return;
+      }
+
+      // Handle Start (Down)
+      if (first) {
+        // Lasso Tool
+        if (options.tool === 'lasso') {
+          const clickedSelected = [...elements].reverse().find(el => 
+            selectedElementIds.has(el.id) && isPointNearElement(point, el, 10)
+          );
+          
+          if (clickedSelected && selectedElementIds.size > 0) {
+            setIsDragging(true);
+            setDragStart(point);
+          } else {
+            setIsDrawing(true);
+            setLassoPath([point]);
+            setSelectedElementIds(new Set());
+          }
+          return;
+        }
+
+        // Text Tool
+        if (options.tool === 'text') {
+          const clickedText = [...elements].reverse().find(el => 
+            el.tool === 'text' && isPointNearElement(point, el, 5)
+          );
+          
+          if (clickedText) {
+            setTextInputPos(clickedText.points[0]);
+            setTextInputValue(clickedText.text || '');
+            setEditingTextId(clickedText.id);
+          } else {
+            setTextInputPos(point);
+            setTextInputValue('');
+            setEditingTextId(null);
+          }
+          return;
+        }
+
+        // Object Eraser
+        if (options.tool === 'object-eraser') {
+          setIsDrawing(true);
+          deletedElementsRef.current = new Set();
+          const clickedElement = [...elements].reverse().find(el => 
+            isPointNearElement(point, el, 15)
+          );
+          if (clickedElement) {
+            deletedElementsRef.current.add(clickedElement.id);
+            setElements(prev => prev.filter(el => el.id !== clickedElement.id));
+            onDeleteElement(clickedElement.id);
+          }
+          return;
+        }
+
+        // Standard Draw
+        setIsDrawing(true);
+        setCurrentPoints([point]);
+      }
+
+      // Handle Move
+      if (active) {
+        // Track mouse for paste
+        lastMousePosRef.current = point;
+
+        if (options.tool === 'lasso' && isDragging && dragStart) {
+          const dx = point.x - dragStart.x;
+          const dy = point.y - dragStart.y;
+          setElements(prev => prev.map(el => {
+            if (selectedElementIds.has(el.id)) {
+              return {
+                ...el,
+                points: el.points.map(p => ({ x: p.x + dx, y: p.y + dy }))
+              };
+            }
+            return el;
+          }));
+          setDragStart(point);
+          return;
+        }
+
+        if (options.tool === 'object-eraser') {
+          const hoveredElement = [...elements].reverse().find(el => 
+            isPointNearElement(point, el, 15)
+          );
+          setHoveredElementId(hoveredElement?.id || null);
+          
+          if (isDrawing && hoveredElement && !deletedElementsRef.current.has(hoveredElement.id)) {
+            deletedElementsRef.current.add(hoveredElement.id);
+            setElements(prev => prev.filter(el => el.id !== hoveredElement.id));
+            onDeleteElement(hoveredElement.id);
+          }
+        } else if (options.tool === 'text') {
+          const hoveredText = [...elements].reverse().find(el => 
+            el.tool === 'text' && isPointNearElement(point, el, 5)
+          );
+          setHoveredElementId(hoveredText?.id || null);
+        } else {
+          setHoveredElementId(null);
+        }
+
+        if (!isDrawing) return;
+
+        if (options.tool === 'lasso') {
+          setLassoPath(prev => [...prev, point]);
+          return;
+        }
+
+        if (options.tool === 'pen' || options.tool === 'eraser' || options.tool === 'laser') {
+          setCurrentPoints(prev => [...prev, point]);
+        } else {
+          setCurrentPoints(prev => [prev[0], point]);
+        }
+      }
+
+      // Handle End (Up)
+      if (last) {
+        if (options.tool === 'lasso' && isDragging) {
+          setIsDragging(false);
+          setDragStart(null);
+          elements.forEach(el => {
+            if (selectedElementIds.has(el.id)) onDrawEvent(el);
+          });
+          return;
+        }
+
+        if (options.tool === 'lasso' && isDrawing && lassoPath.length > 2) {
+          const selected = new Set<string>();
+          elements.forEach(el => {
+            if (isElementInLasso(el, lassoPath)) selected.add(el.id);
+          });
+          setSelectedElementIds(selected);
+          setLassoPath([]);
+          setIsDrawing(false);
+          return;
+        }
+
+        if (options.tool === 'object-eraser') {
+          setIsDrawing(false);
+          deletedElementsRef.current.clear();
+          return;
+        }
+
+        if (!isDrawing) return;
+
+        if (currentPoints.length > 0) {
+          const drawEvent: DrawEvent = {
+            type: options.tool === 'laser' ? 'laser' : 'draw',
+            tool: options.tool,
+            color: options.color,
+            lineWidth: options.lineWidth,
+            lineType: options.lineType,
+            points: currentPoints,
+            timestamp: Date.now(),
+            id: `${Date.now()}-${Math.random()}`
+          };
+
+          if (options.tool === 'laser') {
+            setLaserElements(prev => new Map(prev).set(drawEvent.id, { element: drawEvent, opacity: 1 }));
+          } else {
+            setElements(prev => [...prev, drawEvent]);
+          }
+          onDrawEvent(drawEvent);
+        }
+
+        setIsDrawing(false);
+        setCurrentPoints([]);
+      }
+    },
+
+    onPinch: ({ origin: [cx, cy], movement: [ms], first, memo }) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      
+      if (first) {
+        return { initialZoom: zoom, initialOffset: { ...offset } };
+      }
+      
+      const { initialZoom, initialOffset } = memo;
+      const newZoom = Math.min(Math.max(0.1, initialZoom * ms), 5);
+      
+      const rect = canvas.getBoundingClientRect();
+      const pinchX = cx - rect.left;
+      const pinchY = cy - rect.top;
+      
+      const worldX = (pinchX - initialOffset.x) / initialZoom;
+      const worldY = (pinchY - initialOffset.y) / initialZoom;
+      
+      const newOffsetX = pinchX - worldX * newZoom;
+      const newOffsetY = pinchY - worldY * newZoom;
+      
+      setZoom(newZoom);
+      setOffset({ x: newOffsetX, y: newOffsetY });
+    },
+
+    onWheel: ({ event, delta: [dx, dy], ctrlKey }) => {
+      if (ctrlKey) {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = event.clientX - rect.left;
+        const mouseY = event.clientY - rect.top;
+        
+        const newZoom = Math.min(Math.max(0.1, zoom * (dy > 0 ? 0.9 : 1.1)), 5);
+        const scale = newZoom / zoom;
+        
+        setOffset({
+          x: mouseX - (mouseX - offset.x) * scale,
+          y: mouseY - (mouseY - offset.y) * scale
+        });
+        setZoom(newZoom);
+      } else {
+        // Pan
+        setOffset(prev => ({ x: prev.x - dx, y: prev.y - dy }));
+      }
+    }
+  }, {
+    drag: { filterTaps: true, threshold: 3 },
+    pinch: { scaleBounds: { min: 0.1, max: 5 } },
+    eventOptions: { passive: false } 
+  });
 
   // Initialize elements when initialElements change
   useEffect(() => {
@@ -466,13 +871,36 @@ export default function Whiteboard({
     if (isSelected) {
       ctx.save();
       ctx.strokeStyle = 'rgba(33, 150, 243, 0.8)';
-      ctx.lineWidth = 3;
+      ctx.lineWidth = 1;
       ctx.setLineDash([5, 5]);
       
       // Draw selection box around element
       const bounds = getElementBounds(element);
       if (bounds) {
-        ctx.strokeRect(bounds.minX - 5, bounds.minY - 5, bounds.maxX - bounds.minX + 10, bounds.maxY - bounds.minY + 10);
+        const { minX, minY, maxX, maxY } = bounds;
+        ctx.strokeRect(minX - 5, minY - 5, maxX - minX + 10, maxY - minY + 10);
+
+        // Draw resize handles
+        if (options.tool === 'select') {
+          const handles = [
+            { x: minX - 5, y: minY - 5 }, // tl
+            { x: maxX + 5, y: minY - 5 }, // tr
+            { x: minX - 5, y: maxY + 5 }, // bl
+            { x: maxX + 5, y: maxY + 5 }, // br
+          ];
+
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = '#2196F3';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([]);
+
+          handles.forEach(h => {
+            ctx.beginPath();
+            ctx.arc(h.x, h.y, 4, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+          });
+        }
       }
       
       ctx.setLineDash([]);
@@ -534,6 +962,23 @@ export default function Whiteboard({
       ctx.lineWidth = element.lineWidth * 2;
       drawFreehand(ctx, points);
       ctx.globalCompositeOperation = 'source-over';
+    }
+
+    // Draw text inside shape if present
+    if (element.text && element.tool !== 'text' && points.length >= 2) {
+        const bounds = getElementBounds(element);
+        if (bounds) {
+            const centerX = (bounds.minX + bounds.maxX) / 2;
+            const centerY = (bounds.minY + bounds.maxY) / 2;
+            
+            ctx.save();
+            ctx.font = `${element.fontSize || 16}px sans-serif`;
+            ctx.fillStyle = element.color; // Use shape color for text too? Or black?
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(element.text, centerX, centerY);
+            ctx.restore();
+        }
     }
 
     if (isHovered) {
@@ -725,6 +1170,31 @@ export default function Whiteboard({
     }
   };
 
+  const getResizeHandleAtPoint = (point: Point, element: DrawEvent): ResizeHandle | null => {
+    const threshold = 15 / zoom;
+
+    if (element.tool === 'line' || element.tool === 'arrow') {
+      const start = element.points[0];
+      const end = element.points[element.points.length - 1];
+      
+      if (Math.abs(point.x - start.x) < threshold && Math.abs(point.y - start.y) < threshold) return 'start';
+      if (Math.abs(point.x - end.x) < threshold && Math.abs(point.y - end.y) < threshold) return 'end';
+      return null;
+    }
+
+    const bounds = getElementBounds(element);
+    if (!bounds) return null;
+
+    const { minX, minY, maxX, maxY } = bounds;
+
+    if (Math.abs(point.x - minX) < threshold && Math.abs(point.y - minY) < threshold) return 'tl';
+    if (Math.abs(point.x - maxX) < threshold && Math.abs(point.y - minY) < threshold) return 'tr';
+    if (Math.abs(point.x - minX) < threshold && Math.abs(point.y - maxY) < threshold) return 'bl';
+    if (Math.abs(point.x - maxX) < threshold && Math.abs(point.y - maxY) < threshold) return 'br';
+
+    return null;
+  };
+
   const isPointNearElement = (point: Point, element: DrawEvent, threshold = 10): boolean => {
     if (element.imageData) {
       // Check if point is inside image bounds
@@ -793,6 +1263,10 @@ export default function Whiteboard({
       const dist = Math.sqrt(
         Math.pow(point.x - center.x, 2) + Math.pow(point.y - center.y, 2)
       );
+      // For selection/move, check inside. For eraser, check border.
+      if (options.tool === 'select' || options.tool === 'text') {
+          return dist <= radius + threshold;
+      }
       return Math.abs(dist - radius) < threshold + element.lineWidth;
     }
 
@@ -903,255 +1377,25 @@ export default function Whiteboard({
     return Math.sqrt(dx * dx + dy * dy);
   };
 
-  const getMousePos = (e: React.MouseEvent<HTMLCanvasElement>): Point => {
-    const canvas = canvasRef.current;
-    if (!canvas) return { x: 0, y: 0 };
-    const rect = canvas.getBoundingClientRect();
-    return {
-      x: (e.clientX - rect.left - offset.x) / zoom,
-      y: (e.clientY - rect.top - offset.y) / zoom
-    };
-  };
-
-  const getTouchPos = (e: React.TouchEvent<HTMLCanvasElement>): Point => {
-    const canvas = canvasRef.current;
-    if (!canvas) return { x: 0, y: 0 };
-    const rect = canvas.getBoundingClientRect();
-    const touch = e.touches[0] || e.changedTouches[0];
-    return {
-      x: (touch.clientX - rect.left - offset.x) / zoom,
-      y: (touch.clientY - rect.top - offset.y) / zoom
-    };
-  };
-
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
-      // Middle mouse or Shift+Left mouse for panning
-      setIsPanning(true);
-      setPanStart({ x: e.clientX - offset.x, y: e.clientY - offset.y });
-      return;
-    }
-
-    if (e.button !== 0) return; // Only left mouse button for drawing
-
-    const point = getMousePos(e);
-
-    // Handle lasso tool
-    if (options.tool === 'lasso') {
-      // Check if clicking on a selected element to drag
-      const clickedSelected = [...elements].reverse().find(el => 
-        selectedElementIds.has(el.id) && isPointNearElement(point, el, 10)
-      );
-      
-      if (clickedSelected && selectedElementIds.size > 0) {
-        // Start dragging selected elements
-        setIsDragging(true);
-        setDragStart(point);
-      } else {
-        // Start drawing new lasso selection
-        setIsDrawing(true);
-        setLassoPath([point]);
-        setSelectedElementIds(new Set());
-      }
-      return;
-    }
-
-    // Handle text tool - check if clicking existing text to edit it
-    if (options.tool === 'text') {
-      const clickedText = [...elements].reverse().find(el => 
-        el.tool === 'text' && isPointNearElement(point, el, 5)
-      );
-      
-      if (clickedText) {
-        // Edit existing text
-        setTextInputPos(clickedText.points[0]);
-        setTextInputValue(clickedText.text || '');
-        setEditingTextId(clickedText.id);
-      } else {
-        // Create new text
-        setTextInputPos(point);
-        setTextInputValue('');
-        setEditingTextId(null);
-      }
-      return;
-    }
-
-    // Handle object eraser - start drag-to-delete mode
-    if (options.tool === 'object-eraser') {
-      setIsDrawing(true);
-      deletedElementsRef.current = new Set(); // Reset deleted elements tracking
-      
-      // Delete element under cursor immediately
-      const clickedElement = [...elements].reverse().find(el => 
-        isPointNearElement(point, el, 15)
-      );
-      if (clickedElement) {
-        deletedElementsRef.current.add(clickedElement.id);
-        setElements(prev => prev.filter(el => el.id !== clickedElement.id));
-        onDeleteElement(clickedElement.id);
-      }
-      return;
-    }
-
-    setIsDrawing(true);
-    setCurrentPoints([point]);
-  };
-
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (isPanning) {
-      setOffset({
-        x: e.clientX - panStart.x,
-        y: e.clientY - panStart.y
-      });
-      return;
-    }
-
-    const point = getMousePos(e);
-    
-    // Track mouse position for paste operations
-    lastMousePosRef.current = point;
-
-    // Handle lasso dragging
-    if (options.tool === 'lasso' && isDragging && dragStart) {
-      const dx = point.x - dragStart.x;
-      const dy = point.y - dragStart.y;
-      
-      // Update positions of all selected elements
-      setElements(prev => prev.map(el => {
-        if (selectedElementIds.has(el.id)) {
-          return {
-            ...el,
-            points: el.points.map(p => ({ x: p.x + dx, y: p.y + dy }))
-          };
-        }
-        return el;
-      }));
-      
-      setDragStart(point);
-      return;
-    }
-
-    // Handle object eraser hover and drag-to-delete
-    if (options.tool === 'object-eraser') {
-      const hoveredElement = [...elements].reverse().find(el => 
-        isPointNearElement(point, el, 15)
-      );
-      setHoveredElementId(hoveredElement?.id || null);
-      
-      // If drawing (dragging), delete elements as we hover over them
-      if (isDrawing && hoveredElement && !deletedElementsRef.current.has(hoveredElement.id)) {
-        deletedElementsRef.current.add(hoveredElement.id);
-        setElements(prev => prev.filter(el => el.id !== hoveredElement.id));
-        onDeleteElement(hoveredElement.id);
-      }
-    } else if (options.tool === 'text') {
-      // Highlight text elements when hovering in text mode
-      const hoveredText = [...elements].reverse().find(el => 
-        el.tool === 'text' && isPointNearElement(point, el, 5)
-      );
-      setHoveredElementId(hoveredText?.id || null);
-    } else {
-      setHoveredElementId(null);
-    }
-
-    if (!isDrawing) return;
-
-    // Handle lasso selection drawing
-    if (options.tool === 'lasso') {
-      setLassoPath(prev => [...prev, point]);
-      return;
-    }
-
-    if (options.tool === 'pen' || options.tool === 'eraser' || options.tool === 'laser') {
-      setCurrentPoints(prev => [...prev, point]);
-    } else {
-      // For shapes, only keep start and end points
-      setCurrentPoints(prev => [prev[0], point]);
-    }
-  };
-
-  const handleMouseUp = () => {
-    if (isPanning) {
-      setIsPanning(false);
-      return;
-    }
-
-    // Handle lasso dragging complete
-    if (options.tool === 'lasso' && isDragging) {
-      setIsDragging(false);
-      setDragStart(null);
-      
-      // Send updated elements to server
-      elements.forEach(el => {
-        if (selectedElementIds.has(el.id)) {
-          onDrawEvent(el);
-        }
-      });
-      return;
-    }
-
-    // Handle lasso selection complete
-    if (options.tool === 'lasso' && isDrawing && lassoPath.length > 2) {
-      // Find all elements inside the lasso
-      const selected = new Set<string>();
-      elements.forEach(el => {
-        if (isElementInLasso(el, lassoPath)) {
-          selected.add(el.id);
-        }
-      });
-      
-      setSelectedElementIds(selected);
-      setLassoPath([]);
-      setIsDrawing(false);
-      return;
-    }
-
-    // Handle object eraser - end drag-to-delete mode
-    if (options.tool === 'object-eraser') {
-      setIsDrawing(false);
-      deletedElementsRef.current.clear();
-      return;
-    }
-
-    if (!isDrawing) return;
-
-    if (currentPoints.length > 0) {
-      const drawEvent: DrawEvent = {
-        type: options.tool === 'laser' ? 'laser' : 'draw',
-        tool: options.tool,
-        color: options.color,
-        lineWidth: options.lineWidth,
-        lineType: options.lineType,
-        points: currentPoints,
-        timestamp: Date.now(),
-        id: `${Date.now()}-${Math.random()}`
-      };
-
-      if (options.tool === 'laser') {
-        // Add laser to temporary elements
-        setLaserElements(prev => new Map(prev).set(drawEvent.id, { element: drawEvent, opacity: 1 }));
-      } else {
-        // Add to persistent elements
-        setElements(prev => [...prev, drawEvent]);
-      }
-
-      // Send to server
-      onDrawEvent(drawEvent);
-    }
-
-    setIsDrawing(false);
-    setCurrentPoints([]);
-  };
 
   const handleTextSubmit = () => {
     if (!textInputPos) {
       return;
     }
 
-    // If text is empty and we're editing, delete the text element
+    // If text is empty and we're editing, check if it's a pure text element or a shape
     if (!textInputValue.trim() && editingTextId) {
-      setElements(prev => prev.filter(el => el.id !== editingTextId));
-      onDeleteElement(editingTextId);
+       const element = elements.find(el => el.id === editingTextId);
+       if (element && element.tool === 'text') {
+          setElements(prev => prev.filter(el => el.id !== editingTextId));
+          onDeleteElement(editingTextId);
+       } else if (element) {
+          // It's a shape, just clear the text
+          const updatedElement = { ...element, text: undefined };
+          setElements(prev => prev.map(el => el.id === editingTextId ? updatedElement : el));
+          onDrawEvent(updatedElement);
+       }
+       
       setTextInputPos(null);
       setTextInputValue('');
       setEditingTextId(null);
@@ -1167,22 +1411,31 @@ export default function Whiteboard({
     }
 
     if (editingTextId) {
-      // Update existing text
-      const drawEvent: DrawEvent = {
-        type: 'draw',
-        tool: 'text',
-        color: options.color,
-        lineWidth: options.lineWidth,
-        lineType: options.lineType,
-        points: [textInputPos],
-        text: textInputValue,
-        fontSize: options.lineWidth * 6,
-        timestamp: Date.now(),
-        id: editingTextId
-      };
-
-      setElements(prev => prev.map(el => el.id === editingTextId ? drawEvent : el));
-      onDrawEvent(drawEvent);
+      // Update existing text or shape text
+      const existingElement = elements.find(el => el.id === editingTextId);
+      if (existingElement) {
+          // If it's a shape (not text tool), update its text property
+          if (existingElement.tool !== 'text') {
+             const updatedElement = { 
+                 ...existingElement, 
+                 text: textInputValue,
+                 // Optional: update font size relative to shape?
+                 fontSize: existingElement.fontSize || 16
+             };
+             setElements(prev => prev.map(el => el.id === editingTextId ? updatedElement : el));
+             onDrawEvent(updatedElement);
+          } else {
+             // Regular text element
+             const drawEvent: DrawEvent = {
+               ...existingElement,
+               text: textInputValue,
+               points: [textInputPos], // Update position in case it moved
+               timestamp: Date.now()
+             };
+             setElements(prev => prev.map(el => el.id === editingTextId ? drawEvent : el));
+             onDrawEvent(drawEvent);
+          }
+      }
     } else {
       // Create new text
       const drawEvent: DrawEvent = {
@@ -1214,300 +1467,7 @@ export default function Whiteboard({
     }
   };
 
-  // Touch event handlers for iPad/tablet support
-  const handleTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    
-    if (e.touches.length === 2) {
-      // Two-finger touch for pinch-to-zoom and panning
-      const touch1 = e.touches[0];
-      const touch2 = e.touches[1];
-      const distance = Math.sqrt(
-        Math.pow(touch2.clientX - touch1.clientX, 2) + 
-        Math.pow(touch2.clientY - touch1.clientY, 2)
-      );
-      lastPinchDistanceRef.current = distance;
-      
-      setIsPanning(true);
-      const touch = e.touches[0];
-      setPanStart({ x: touch.clientX - offset.x, y: touch.clientY - offset.y });
-      return;
-    }
 
-    if (e.touches.length !== 1) return;
-
-    const point = getTouchPos(e);
-
-    // Handle lasso tool
-    if (options.tool === 'lasso') {
-      // Check if clicking on a selected element to drag
-      const clickedSelected = [...elements].reverse().find(el => 
-        selectedElementIds.has(el.id) && isPointNearElement(point, el, 10)
-      );
-      
-      if (clickedSelected && selectedElementIds.size > 0) {
-        // Start dragging selected elements
-        setIsDragging(true);
-        setDragStart(point);
-      } else {
-        // Start drawing new lasso selection
-        setIsDrawing(true);
-        setLassoPath([point]);
-        setSelectedElementIds(new Set());
-      }
-      return;
-    }
-
-    // Handle text tool - check if clicking existing text to edit it
-    if (options.tool === 'text') {
-      const clickedText = [...elements].reverse().find(el => 
-        el.tool === 'text' && isPointNearElement(point, el, 5)
-      );
-      
-      if (clickedText) {
-        // Edit existing text
-        setTextInputPos(clickedText.points[0]);
-        setTextInputValue(clickedText.text || '');
-        setEditingTextId(clickedText.id);
-      } else {
-        // Create new text
-        setTextInputPos(point);
-        setTextInputValue('');
-        setEditingTextId(null);
-      }
-      return;
-    }
-
-    // Handle object eraser - start drag-to-delete mode
-    if (options.tool === 'object-eraser') {
-      setIsDrawing(true);
-      deletedElementsRef.current = new Set(); // Reset deleted elements tracking
-      
-      // Delete element under cursor immediately
-      const clickedElement = [...elements].reverse().find(el => 
-        isPointNearElement(point, el, 15)
-      );
-      if (clickedElement) {
-        deletedElementsRef.current.add(clickedElement.id);
-        setElements(prev => prev.filter(el => el.id !== clickedElement.id));
-        onDeleteElement(clickedElement.id);
-      }
-      return;
-    }
-
-    setIsDrawing(true);
-    setCurrentPoints([point]);
-  };
-
-  const handleTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-
-    if (isPanning && e.touches.length === 2) {
-      const touch1 = e.touches[0];
-      const touch2 = e.touches[1];
-      
-      // Calculate new distance for pinch-to-zoom
-      const distance = Math.sqrt(
-        Math.pow(touch2.clientX - touch1.clientX, 2) + 
-        Math.pow(touch2.clientY - touch1.clientY, 2)
-      );
-      
-      if (lastPinchDistanceRef.current) {
-        const scale = distance / lastPinchDistanceRef.current;
-        const newZoom = Math.min(Math.max(0.1, zoom * scale), 5);
-        
-        // Calculate pinch center
-        const canvas = canvasRef.current;
-        if (canvas) {
-          const rect = canvas.getBoundingClientRect();
-          const centerX = (touch1.clientX + touch2.clientX) / 2 - rect.left;
-          const centerY = (touch1.clientY + touch2.clientY) / 2 - rect.top;
-          
-          // Zoom towards pinch center
-          const zoomScale = newZoom / zoom;
-          setOffset({
-            x: centerX - (centerX - offset.x) * zoomScale,
-            y: centerY - (centerY - offset.y) * zoomScale
-          });
-          
-          setZoom(newZoom);
-        }
-        
-        lastPinchDistanceRef.current = distance;
-      }
-      
-      // Also handle panning with two fingers
-      const touch = e.touches[0];
-      setOffset({
-        x: touch.clientX - panStart.x,
-        y: touch.clientY - panStart.y
-      });
-      return;
-    }
-
-    if (e.touches.length !== 1) return;
-
-    const point = getTouchPos(e);
-
-    // Handle lasso dragging
-    if (options.tool === 'lasso' && isDragging && dragStart) {
-      const dx = point.x - dragStart.x;
-      const dy = point.y - dragStart.y;
-      
-      // Update positions of all selected elements
-      setElements(prev => prev.map(el => {
-        if (selectedElementIds.has(el.id)) {
-          return {
-            ...el,
-            points: el.points.map(p => ({ x: p.x + dx, y: p.y + dy }))
-          };
-        }
-        return el;
-      }));
-      
-      setDragStart(point);
-      return;
-    }
-
-    // Handle object eraser hover and drag-to-delete
-    if (options.tool === 'object-eraser') {
-      const hoveredElement = [...elements].reverse().find(el => 
-        isPointNearElement(point, el, 15)
-      );
-      setHoveredElementId(hoveredElement?.id || null);
-      
-      // If drawing (dragging), delete elements as we hover over them
-      if (isDrawing && hoveredElement && !deletedElementsRef.current.has(hoveredElement.id)) {
-        deletedElementsRef.current.add(hoveredElement.id);
-        setElements(prev => prev.filter(el => el.id !== hoveredElement.id));
-        onDeleteElement(hoveredElement.id);
-      }
-    } else if (options.tool === 'text') {
-      // Highlight text elements when hovering in text mode
-      const hoveredText = [...elements].reverse().find(el => 
-        el.tool === 'text' && isPointNearElement(point, el, 5)
-      );
-      setHoveredElementId(hoveredText?.id || null);
-    } else {
-      setHoveredElementId(null);
-    }
-
-    if (!isDrawing) return;
-
-    // Handle lasso selection drawing
-    if (options.tool === 'lasso') {
-      setLassoPath(prev => [...prev, point]);
-      return;
-    }
-
-    if (options.tool === 'pen' || options.tool === 'eraser' || options.tool === 'laser') {
-      setCurrentPoints(prev => [...prev, point]);
-    } else {
-      // For shapes, only keep start and end points
-      setCurrentPoints(prev => [prev[0], point]);
-    }
-  };
-
-  const handleTouchEnd = (e: React.TouchEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-
-    if (isPanning) {
-      setIsPanning(false);
-      lastPinchDistanceRef.current = null;
-      return;
-    }
-
-    // Handle lasso dragging complete
-    if (options.tool === 'lasso' && isDragging) {
-      setIsDragging(false);
-      setDragStart(null);
-      
-      // Send updated elements to server
-      elements.forEach(el => {
-        if (selectedElementIds.has(el.id)) {
-          onDrawEvent(el);
-        }
-      });
-      return;
-    }
-
-    // Handle lasso selection complete
-    if (options.tool === 'lasso' && isDrawing && lassoPath.length > 2) {
-      // Find all elements inside the lasso
-      const selected = new Set<string>();
-      elements.forEach(el => {
-        if (isElementInLasso(el, lassoPath)) {
-          selected.add(el.id);
-        }
-      });
-      
-      setSelectedElementIds(selected);
-      setLassoPath([]);
-      setIsDrawing(false);
-      return;
-    }
-
-    // Handle object eraser - end drag-to-delete mode
-    if (options.tool === 'object-eraser') {
-      setIsDrawing(false);
-      deletedElementsRef.current.clear();
-      return;
-    }
-
-    if (!isDrawing) return;
-
-    if (currentPoints.length > 0) {
-      const drawEvent: DrawEvent = {
-        type: options.tool === 'laser' ? 'laser' : 'draw',
-        tool: options.tool,
-        color: options.color,
-        lineWidth: options.lineWidth,
-        lineType: options.lineType,
-        points: currentPoints,
-        timestamp: Date.now(),
-        id: `${Date.now()}-${Math.random()}`
-      };
-
-      if (options.tool === 'laser') {
-        // Add laser to temporary elements
-        setLaserElements(prev => new Map(prev).set(drawEvent.id, { element: drawEvent, opacity: 1 }));
-      } else {
-        // Add to persistent elements
-        setElements(prev => [...prev, drawEvent]);
-      }
-
-      // Send to server
-      onDrawEvent(drawEvent);
-    }
-
-    setIsDrawing(false);
-    setCurrentPoints([]);
-  };
-
-  // Mouse wheel zoom for desktop
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    
-    const rect = canvas.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-    
-    // Zoom in or out
-    const delta = e.deltaY > 0 ? 0.9 : 1.1;
-    const newZoom = Math.min(Math.max(0.1, zoom * delta), 5);
-    
-    // Adjust offset to zoom towards mouse position
-    const scale = newZoom / zoom;
-    setOffset({
-      x: mouseX - (mouseX - offset.x) * scale,
-      y: mouseY - (mouseY - offset.y) * scale
-    });
-    
-    setZoom(newZoom);
-  };
 
   // Zoom control functions
   const handleZoomChange = (newZoom: number) => {
@@ -1557,15 +1517,7 @@ export default function Whiteboard({
       <canvas
         ref={canvasRef}
         className="whiteboard-canvas"
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        onWheel={handleWheel}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-        onTouchCancel={handleTouchEnd}
+        {...bind()}
         style={{ cursor: getCursor(), touchAction: 'none' }}
       />
       
